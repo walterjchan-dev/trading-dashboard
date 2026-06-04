@@ -8,64 +8,6 @@ app = FastAPI()
 
 WATCHLIST = ["PLTR", "AMZN", "GOOG", "MSFT", "AVGO", "NVDA", "BE", "CRDO"]
 
-MARKET = {
-    "QQQ": "QQQ",
-    "SPY": "SPY",
-    "Oil": "CL=F",
-    "10Y Yield": "^TNX",
-    "VIX": "^VIX",
-    "Bitcoin": "BTC-USD",
-}
-
-def nav():
-    return """
-    <div style="margin-bottom:20px;">
-        <a href="/dashboard">RSI Dashboard</a> |
-        <a href="/market">Market Overview</a>
-    </div>
-    """
-
-def get_market_data():
-    data = []
-
-    for name, ticker in MARKET.items():
-        df = yf.download(
-            ticker,
-            period="10d",
-            interval="1d",
-            progress=False,
-            auto_adjust=True
-        )
-
-        if df.empty or len(df) < 2:
-            continue
-
-        close = df["Close"]
-
-        last = float(close.iloc[-1].iloc[0]) if hasattr(close.iloc[-1], "iloc") else float(close.iloc[-1])
-        prev = float(close.iloc[-2].iloc[0]) if hasattr(close.iloc[-2], "iloc") else float(close.iloc[-2])
-
-        change_pct = (last - prev) / prev * 100
-
-        if change_pct > 1:
-            signal = "🟢 Strong Up"
-        elif change_pct > 0:
-            signal = "🟡 Up"
-        elif change_pct > -1:
-            signal = "🟠 Slight Down"
-        else:
-            signal = "🔴 Down"
-
-        data.append({
-            "name": name,
-            "price": last,
-            "change_pct": change_pct,
-            "signal": signal
-        })
-
-    return data
-
-
 def get_rsi_1h(ticker):
     df = yf.download(
         ticker,
@@ -231,54 +173,6 @@ def dashboard():
                 <th>-30m</th>
                 <th>Score</th>
                 <th>Trend</th>
-            </tr>
-            {rows}
-        </table>
-    </body>
-    </html>
-    """
-
-@app.get("/market", response_class=HTMLResponse)
-def market():
-    data = get_market_data()
-    updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    rows = ""
-
-    for d in data:
-        rows += f"""
-        <tr>
-            <td>{d['name']}</td>
-            <td>{d['price']:.2f}</td>
-            <td>{d['change_pct']:+.2f}%</td>
-            <td>{d['signal']}</td>
-        </tr>
-        """
-
-    return f"""
-    <html>
-    <head>
-        <meta http-equiv="refresh" content="60">
-        <style>
-            body {{ font-family: Arial; margin: 30px; }}
-            table {{ border-collapse: collapse; width: 100%; }}
-            th, td {{ border: 1px solid #ccc; padding: 10px; text-align: center; }}
-            th {{ background: #eee; }}
-            a {{ font-size: 18px; margin-right: 10px; }}
-        </style>
-    </head>
-    <body>
-        {nav()}
-
-        <h2>Market Overview</h2>
-        <p>Updated: {updated}</p>
-
-        <table>
-            <tr>
-                <th>Market</th>
-                <th>Price</th>
-                <th>Daily Change</th>
-                <th>Signal</th>
             </tr>
             {rows}
         </table>
