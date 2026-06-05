@@ -8,6 +8,10 @@ app = FastAPI()
 
 WATCHLIST = ["PLTR", "AMZN", "GOOG", "MSFT", "AVGO", "NVDA", "BE", "CRDO"]
 
+WATCHLIST2 = ["AMD", "MRVL", "ASX", "IREN", "OKLO", "NBIS", "ALAB", "MARA"]
+
+
+
 MARKET = {
     "QQQ": "QQQ",
     "SPY": "SPY",
@@ -20,7 +24,8 @@ MARKET = {
 def nav():
     return """
     <div style="margin-bottom:20px;">
-        <a href="/dashboard">RSI Dashboard</a> |
+        <a href="/dashboard">Dashboard 1</a> |
+        <a href="/dashboard2">Dashboard 2</a> |
         <a href="/market">Market Overview</a>
     </div>
     """
@@ -148,36 +153,35 @@ def get_rsi_data(ticker):
         "trend": trend,
     }
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
+def build_dashboard(title, watchlist):
     data = []
 
-    for ticker in WATCHLIST:
+    for ticker in watchlist:
         result = get_rsi_data(ticker)
 
         if result:
             result["rsi1h"] = get_rsi_1h(ticker)
-            
+
             rsi15 = result["now"]
             rsi1h = result["rsi1h"]
 
-            if rsi15 > 50 and rsi1h > 50:
+            if rsi1h is None:
+                result["setup"] = "⚪ No 1H Data"
+            elif rsi15 > 50 and rsi1h > 50:
                 result["setup"] = "🟢 Strong"
-
             elif rsi15 < 50 and rsi1h > 50:
                 result["setup"] = "🟡 Pullback"
-
             elif rsi15 > 50 and rsi1h < 50:
                 result["setup"] = "🔵 Early Reversal"
-
             else:
                 result["setup"] = "🔴 Weak"
+
             data.append(result)
-       
+
     data.sort(key=lambda x: x["score"], reverse=True)
 
     rows = ""
-    rows = ""
+
     for d in data:
         score = d["score"]
 
@@ -190,12 +194,14 @@ def dashboard():
         else:
             color = "#FF9999"
 
+        rsi1h_text = f"{d['rsi1h']:.2f}" if d["rsi1h"] is not None else "N/A"
         rows += f"""
+        
         <tr style="background-color:{color}">
             <td>{d['ticker']}</td>
             <td>{d['price']:.2f}</td>
             <td>{d['now']:.2f}</td>
-            <td>{d['rsi1h']:.2f}</td>
+            <td>{rsi1h_text}</td>
             <td>{d['setup']}</td>
             <td>{d['prev1']:.2f}</td>
             <td>{d['prev2']:.2f}</td>
@@ -203,7 +209,7 @@ def dashboard():
             <td>{d['trend']}</td>
         </tr>
         """
-    
+
     updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return f"""
@@ -215,11 +221,15 @@ def dashboard():
             table {{ border-collapse: collapse; width: 100%; }}
             th, td {{ border: 1px solid #ccc; padding: 10px; text-align: center; }}
             th {{ background: #eee; }}
+            a {{ font-size: 18px; margin-right: 10px; }}
         </style>
     </head>
     <body>
-        <h2>15-Min RSI Dashboard</h2>
+        {nav()}
+
+        <h2>{title}</h2>
         <p>Updated: {updated}</p>
+
         <table>
             <tr>
                 <th>Ticker</th>
@@ -237,6 +247,14 @@ def dashboard():
     </body>
     </html>
     """
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return build_dashboard("15-Min RSI Dashboard", WATCHLIST)
+
+@app.get("/dashboard2", response_class=HTMLResponse)
+def dashboard2():
+    return build_dashboard("15-Min RSI Dashboard 2", WATCHLIST2)
 
 @app.get("/market", response_class=HTMLResponse)
 def market():
