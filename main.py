@@ -6,10 +6,16 @@ from datetime import datetime
 
 app = FastAPI()
 
-WATCHLIST = ["PLTR", "AMZN", "GOOG", "MSFT", "AVGO", "NVDA", "BE", "CRDO"]
-
-WATCHLIST2 = ["AMD", "MRVL", "ASX", "IREN", "OKLO", "NBIS", "ALAB", "MARA"]
-
+def load_watchlist(filename):
+    try:
+        with open(filename, "r") as f:
+            return [
+                line.strip().upper()
+                for line in f
+                if line.strip() and not line.strip().startswith("#")
+            ]
+    except FileNotFoundError:
+        return []
 
 
 MARKET = {
@@ -24,8 +30,9 @@ MARKET = {
 def nav():
     return """
     <div style="margin-bottom:20px;">
-        <a href="/dashboard">Dashboard 1</a> |
-        <a href="/dashboard2">Dashboard 2</a> |
+        <a href="/dashboard">Watchlist 1</a> |
+        <a href="/dashboard2">Watchlist 2</a> |
+        <a href="/dashboard3">Watchlist 3</a> |
         <a href="/market">Market Overview</a>
     </div>
     """
@@ -250,11 +257,15 @@ def build_dashboard(title, watchlist):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    return build_dashboard("15-Min RSI Dashboard", WATCHLIST)
+    return build_dashboard("Watchlist 1", load_watchlist("watchlist1.txt"))
 
 @app.get("/dashboard2", response_class=HTMLResponse)
 def dashboard2():
-    return build_dashboard("15-Min RSI Dashboard 2", WATCHLIST2)
+    return build_dashboard("Watchlist 2", load_watchlist("watchlist2.txt"))
+
+@app.get("/dashboard3", response_class=HTMLResponse)
+def dashboard3():
+    return build_dashboard("Watchlist 3", load_watchlist("watchlist3.txt"))
 
 @app.get("/market", response_class=HTMLResponse)
 def market():
