@@ -1,10 +1,47 @@
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 import yfinance as yf
 import pandas as pd
 from datetime import datetime
+import json
+import os
+import urllib.parse
+import urllib.request
 
 app = FastAPI()
+MONITOR_FILE = "monitor.json"
+
+def load_monitors():
+    try:
+        with open(MONITOR_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_monitors(monitors):
+    with open(MONITOR_FILE, "w") as f:
+        json.dump(monitors, f, indent=2)
+
+def log_monitor_on(ticker):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        return
+
+    data = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": f"Monitor ON: {ticker}",
+    }).encode()
+
+    try:
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data,
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 def load_watchlist(filename):
     try:
@@ -160,8 +197,9 @@ def get_rsi_data(ticker):
         "trend": trend,
     }
 
-def build_dashboard(title, watchlist):
+def build_dashboard(title, watchlist, dashboard_path):
     data = []
+    monitors = load_monitors()
 
     for ticker in watchlist:
         result = get_rsi_data(ticker)
@@ -202,10 +240,19 @@ def build_dashboard(title, watchlist):
             color = "#FF9999"
 
         rsi1h_text = f"{d['rsi1h']:.2f}" if d["rsi1h"] is not None else "N/A"
+        monitor_status = monitors.get(d["ticker"], "OFF")
+        monitor_color = "#2e7d32" if monitor_status == "ON" else "#777"
         rows += f"""
         
         <tr style="background-color:{color}">
             <td>{d['ticker']}</td>
+            <td>
+                <form method="post" action="/monitor?ticker={d['ticker']}&return_to={dashboard_path}">
+                    <button type="submit" style="background:{monitor_color};color:white;border:0;padding:6px 12px;cursor:pointer;">
+                        {monitor_status}
+                    </button>
+                </form>
+            </td>
             <td>{d['price']:.2f}</td>
             <td>{d['now']:.2f}</td>
             <td>{rsi1h_text}</td>
@@ -240,6 +287,7 @@ def build_dashboard(title, watchlist):
         <table>
             <tr>
                 <th>Ticker</th>
+                <th>Monitor</th>
                 <th>Price</th>
                 <th>RSI15</th>
                 <th>RSI1H</th>
@@ -255,17 +303,32 @@ def build_dashboard(title, watchlist):
     </html>
     """
 
+@app.post("/monitor")
+def toggle_monitor(ticker: str, return_to: str = "/dashboard"):
+    monitors = load_monitors()
+    ticker = ticker.upper()
+    monitors[ticker] = "OFF" if monitors.get(ticker) == "ON" else "ON"
+    save_monitors(monitors)
+
+    if monitors[ticker] == "ON":
+        log_monitor_on(ticker)
+
+    if return_to not in ("/dashboard", "/dashboard2", "/dashboard3"):
+        return_to = "/dashboard"
+
+    return RedirectResponse(return_to, status_code=303)
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    return build_dashboard("Watchlist 1", load_watchlist("watchlist1.txt"))
+    return build_dashboard("Watchlist 1", load_watchlist("watchlist1.txt"), "/dashboard")
 
 @app.get("/dashboard2", response_class=HTMLResponse)
 def dashboard2():
-    return build_dashboard("Watchlist 2", load_watchlist("watchlist2.txt"))
+    return build_dashboard("Watchlist 2", load_watchlist("watchlist2.txt"), "/dashboard2")
 
 @app.get("/dashboard3", response_class=HTMLResponse)
 def dashboard3():
-    return build_dashboard("Watchlist 3", load_watchlist("watchlist3.txt"))
+    return build_dashboard("Watchlist 3", load_watchlist("watchlist3.txt"), "/dashboard3")
 
 @app.get("/market", response_class=HTMLResponse)
 def market():
