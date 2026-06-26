@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 import yfinance as yf
 import pandas as pd
@@ -23,28 +23,31 @@ def save_monitors(monitors):
     with open(MONITOR_FILE, "w") as f:
         json.dump(monitors, f, indent=2)
 
-def log_monitor_on(ticker):
+def send_telegram_message(text):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
-        print("Telegram log skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+        print("Telegram message skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
         return
 
     data = urllib.parse.urlencode({
         "chat_id": chat_id,
-        "text": f"Monitor ON: {ticker}",
+        "text": text,
     }).encode()
 
     try:
         with urllib.request.urlopen(
             f"https://api.telegram.org/bot{token}/sendMessage",
             data=data,
-            timeout=5,
+            timeout=8,
         ):
             pass
     except Exception as error:
-        print(f"Telegram log failed: {error}")
+        print(f"Telegram message failed: {error}")
+
+def log_monitor_on(ticker):
+    send_telegram_message(f"Monitor ON: {ticker}")
 
 def load_watchlist(filename):
     try:
@@ -135,6 +138,63 @@ def calc_rsi(close, length=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+def get_price_structure(df, timeframe):
+    interval_minutes = {"15m": 15, "30m": 30, "1h": 60}
+    last_candle_start = pd.Timestamp(df.index[-1])
+
+    if last_candle_start.tzinfo is None:
+        now = pd.Timestamp.now()
+    else:
+        now = pd.Timestamp.now(tz=last_candle_start.tzinfo)
+
+    last_candle_complete = now >= (
+        last_candle_start + pd.Timedelta(minutes=interval_minutes[timeframe])
+    )
+    completed = df.iloc[-5:] if last_candle_complete else df.iloc[-6:-1]
+
+    if len(completed) < 5:
+        return {"structure": "N/A", "structure_score": 0}
+
+    highs = completed["High"]
+    lows = completed["Low"]
+    if isinstance(highs, pd.DataFrame):
+        highs = highs.iloc[:, 0]
+    if isinstance(lows, pd.DataFrame):
+        lows = lows.iloc[:, 0]
+
+    comparisons = []
+    structure_score = 0
+
+    for index in range(1, len(completed)):
+        higher_high = highs.iloc[index] > highs.iloc[index - 1]
+        higher_low = lows.iloc[index] > lows.iloc[index - 1]
+        lower_high = highs.iloc[index] < highs.iloc[index - 1]
+        lower_low = lows.iloc[index] < lows.iloc[index - 1]
+
+        structure_score += int(higher_high) + int(higher_low)
+        structure_score -= int(lower_high) + int(lower_low)
+        comparisons.append((higher_high, higher_low, lower_high, lower_low))
+
+    strong_comparisons = sum(
+        1 for higher_high, higher_low, _, _ in comparisons
+        if higher_high and higher_low
+    )
+    latest_higher_high, latest_higher_low, latest_lower_high, latest_lower_low = comparisons[-1]
+
+    if latest_lower_high and latest_lower_low:
+        structure = "🔴 Lower Low"
+    elif strong_comparisons >= 3:
+        structure = "🟢 HH/HL Strong"
+    elif not latest_higher_low:
+        structure = "🟠 Weakening"
+    else:
+        structure = "🟡 Pullback"
+
+    return {
+        "structure": structure,
+        "structure_score": structure_score,
+    }
+
 def get_rsi_data(ticker, timeframe):
     config = RSI_TIMEFRAMES[timeframe]
     df = yf.download(
@@ -171,6 +231,7 @@ def get_rsi_data(ticker, timeframe):
         trend = "→ Flat"
 
     price = float(close.iloc[-1].iloc[0]) if hasattr(close.iloc[-1], "iloc") else float(close.iloc[-1])
+    price_structure = get_price_structure(df, timeframe)
 
     return {
         "ticker": ticker,
@@ -180,6 +241,7 @@ def get_rsi_data(ticker, timeframe):
         "prev2": prev2,
         "score": score,
         "trend": trend,
+        **price_structure,
     }
 
 def get_snapshot_setup(rsi):
@@ -266,6 +328,8 @@ def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
             <td>{d['prev2']:.2f}</td>
             <td>{d['score']:+.2f}</td>
             <td>{d['trend']}</td>
+            <td>{d['structure']}</td>
+            <td>{d['structure_score']:+d}</td>
         </tr>
         """
 
@@ -331,12 +395,49 @@ def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
                 <th>Two Bars Ago</th>
                 <th>Score</th>
                 <th>Trend</th>
+                <th>HH/HL</th>
+                <th>Structure Score</th>
             </tr>
             {rows}
         </table>
     </body>
     </html>
     """
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"ok": False, "error": "Invalid JSON"}
+
+    ticker = payload.get("ticker", "")
+    signal = payload.get("signal", "")
+    price = payload.get("price", "")
+    timeframe = payload.get("timeframe", "")
+
+    lines = [f"{ticker} - {signal}", f"Price: {price}"]
+    optional_fields = (
+        ("Timeframe", timeframe),
+        ("RSI", payload.get("rsi")),
+        ("RSI MA", payload.get("rsi_ma")),
+        ("EMA21", payload.get("ema21")),
+        ("BB Upper", payload.get("bb_upper")),
+        ("BB Lower", payload.get("bb_lower")),
+        ("BB Distance", payload.get("bb_distance")),
+        ("ATR", payload.get("atr")),
+        ("Volume", payload.get("volume")),
+        ("Bar Time", payload.get("bar_time")),
+    )
+
+    lines.extend(
+        f"{label}: {value}"
+        for label, value in optional_fields
+        if value not in (None, "")
+    )
+    send_telegram_message("\n".join(lines))
+
+    return {"ok": True, "received": payload}
 
 @app.get("/snapshot/{ticker}", response_class=HTMLResponse)
 def multi_timeframe_snapshot(
@@ -378,7 +479,7 @@ def multi_timeframe_snapshot(
             rows += f"""
             <tr>
                 <td><strong>{label}</strong></td>
-                <td colspan="6">Data unavailable</td>
+                <td colspan="8">Data unavailable</td>
             </tr>
             """
             continue
@@ -396,6 +497,8 @@ def multi_timeframe_snapshot(
             <td>{result['setup']}</td>
             <td>{result['snapshot_trend']}</td>
             <td>{result['score']:+.2f}</td>
+            <td>{result['structure']}</td>
+            <td>{result['structure_score']:+d}</td>
         </tr>
         """
 
@@ -424,7 +527,7 @@ def multi_timeframe_snapshot(
                 background: #f5f7fa;
             }}
             .snapshot {{
-                max-width: 900px;
+                max-width: 1100px;
                 margin: 0 auto;
                 background: white;
                 padding: 18px;
@@ -494,6 +597,8 @@ def multi_timeframe_snapshot(
                     <th>Setup</th>
                     <th>Trend</th>
                     <th>Score</th>
+                    <th>HH/HL</th>
+                    <th>Structure</th>
                 </tr>
                 {rows}
             </table>
