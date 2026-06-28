@@ -2,7 +2,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+from datetime import date, datetime, timedelta
+import csv
 import html
 import json
 import os
@@ -11,6 +12,10 @@ import urllib.request
 
 app = FastAPI()
 MONITOR_FILE = "monitor.json"
+PORTFOLIO_FILE = "portfolio.json"
+PORTFOLIO_CSV_FILE = "portfolio.csv"
+EARNINGS_CACHE_FILE = "earnings_cache.json"
+EARNINGS_CACHE_TTL = timedelta(hours=24)
 
 def load_monitors():
     try:
@@ -22,6 +27,258 @@ def load_monitors():
 def save_monitors(monitors):
     with open(MONITOR_FILE, "w") as f:
         json.dump(monitors, f, indent=2)
+
+def load_portfolio():
+    try:
+        with open(PORTFOLIO_FILE, "r") as f:
+            portfolio = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+    return {
+        ticker.upper(): position
+        for ticker, position in portfolio.items()
+        if isinstance(position, dict)
+    }
+
+def save_portfolio(portfolio):
+    with open(PORTFOLIO_FILE, "w") as f:
+        json.dump(portfolio, f, indent=2)
+
+def load_earnings_cache():
+    try:
+        with open(EARNINGS_CACHE_FILE, "r") as f:
+            cache = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+    return cache if isinstance(cache, dict) else {}
+
+def save_earnings_cache(cache):
+    with open(EARNINGS_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+def parse_earnings_date(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple, set, pd.Series, pd.Index)):
+        dates = [parse_earnings_date(item) for item in value]
+        dates = [item for item in dates if item]
+        return min(dates) if dates else None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    try:
+        parsed = pd.to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+
+    if pd.isna(parsed):
+        return None
+
+    return parsed.date()
+
+def parse_cache_datetime(value):
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+    return parsed
+
+def next_future_date(values):
+    today = date.today()
+    dates = []
+
+    for value in values:
+        parsed = parse_earnings_date(value)
+        if parsed and parsed >= today:
+            dates.append(parsed)
+
+    return min(dates) if dates else None
+
+def extract_calendar_dates(calendar):
+    if calendar is None:
+        return []
+
+    if isinstance(calendar, dict):
+        values = []
+
+        for key, value in calendar.items():
+            if "earnings" in str(key).lower():
+                values.append(value)
+
+        return values
+
+    if isinstance(calendar, pd.DataFrame):
+        values = []
+
+        for column in calendar.columns:
+            if "earnings" in str(column).lower():
+                values.extend(calendar[column].dropna().tolist())
+
+        index_labels = [str(item).lower() for item in calendar.index]
+        for row_index, label in enumerate(index_labels):
+            if "earnings" in label:
+                values.extend(calendar.iloc[row_index].dropna().tolist())
+
+        return values
+
+    return []
+
+def fetch_earnings_date(ticker):
+    stock = yf.Ticker(ticker)
+
+    try:
+        earnings_dates = stock.get_earnings_dates(limit=12)
+        if isinstance(earnings_dates, pd.DataFrame) and not earnings_dates.empty:
+            upcoming = next_future_date(list(earnings_dates.index))
+            if upcoming:
+                return upcoming.isoformat()
+
+            if "Earnings Date" in earnings_dates.columns:
+                upcoming = next_future_date(earnings_dates["Earnings Date"].tolist())
+                if upcoming:
+                    return upcoming.isoformat()
+    except Exception as error:
+        print(f"Earnings dates unavailable for {ticker}: {error}")
+
+    try:
+        upcoming = next_future_date(extract_calendar_dates(stock.calendar))
+        if upcoming:
+            return upcoming.isoformat()
+    except Exception as error:
+        print(f"Earnings calendar unavailable for {ticker}: {error}")
+
+    return None
+
+def earnings_cache_entry_is_fresh(entry):
+    if not isinstance(entry, dict):
+        return False
+
+    fetched_at = parse_cache_datetime(entry.get("fetched_at"))
+    if not fetched_at or datetime.now() - fetched_at > EARNINGS_CACHE_TTL:
+        return False
+
+    earnings_date = parse_earnings_date(entry.get("date"))
+    return earnings_date is None or earnings_date >= date.today()
+
+def get_earnings_info(ticker, cache):
+    ticker = ticker.upper()
+    entry = cache.get(ticker)
+
+    if not earnings_cache_entry_is_fresh(entry):
+        entry = {
+            "date": fetch_earnings_date(ticker),
+            "fetched_at": datetime.now().isoformat(),
+        }
+        cache[ticker] = entry
+
+    earnings_date = parse_earnings_date(entry.get("date"))
+    if not earnings_date:
+        return {
+            "date_text": "-",
+            "days": None,
+            "risk": "none",
+            "style": "",
+            "reason": "",
+        }
+
+    days = (earnings_date - date.today()).days
+    if days <= 7:
+        risk = "high"
+        style = "background:#fecaca;color:#7f1d1d;font-weight:bold;"
+    elif days <= 14:
+        risk = "caution"
+        style = "background:#fef08a;color:#713f12;font-weight:bold;"
+    else:
+        risk = "normal"
+        style = ""
+
+    day_label = "today" if days == 0 else f"in {days} day{'s' if days != 1 else ''}"
+
+    return {
+        "date_text": earnings_date.strftime("%Y-%m-%d"),
+        "days": days,
+        "risk": risk,
+        "style": style,
+        "reason": f"earnings {day_label}",
+    }
+
+def get_csv_value(row, *names):
+    for name in names:
+        value = row.get(name)
+        if value not in (None, ""):
+            return value
+    return ""
+
+def load_portfolio_csv():
+    portfolio = {}
+
+    try:
+        with open(PORTFOLIO_CSV_FILE, "r", newline="") as f:
+            reader = csv.DictReader(f)
+
+            for raw_row in reader:
+                row = {
+                    key.strip().lower().replace(" ", "_"): value.strip()
+                    for key, value in raw_row.items()
+                    if key
+                }
+                ticker = get_csv_value(
+                    row,
+                    "ticker",
+                    "symbol",
+                    "financial_instrument",
+                    "instrument",
+                ).upper()
+                shares = safe_float(
+                    get_csv_value(row, "shares", "quantity", "qty", "position")
+                )
+                average_price = safe_float(
+                    get_csv_value(row, "average_price", "avg_price", "avg_cost", "average_cost")
+                )
+                currency = get_csv_value(row, "account_currency", "currency")
+                notes = get_csv_value(row, "notes", "note")
+
+                if not ticker or shares <= 0:
+                    continue
+
+                position = {
+                    "shares": shares,
+                    "average_price": average_price,
+                    "currency": currency or "USD",
+                }
+
+                if notes:
+                    position["notes"] = notes
+
+                portfolio[ticker] = position
+    except FileNotFoundError:
+        return {}
+
+    return portfolio
+
+def count_portfolio_csv_rows():
+    try:
+        with open(PORTFOLIO_CSV_FILE, "r", newline="") as f:
+            return sum(1 for row in csv.DictReader(f) if any(row.values()))
+    except FileNotFoundError:
+        return 0
 
 def send_telegram_message(text):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -76,6 +333,8 @@ def nav():
         <a href="/dashboard">Watchlist 1</a> |
         <a href="/dashboard2">Watchlist 2</a> |
         <a href="/dashboard3">Watchlist 3</a> |
+        <a href="/monitors">Monitors</a> |
+        <a href="/portfolio">Portfolio</a> |
         <a href="/market">Market Overview</a>
     </div>
     """
@@ -113,6 +372,7 @@ def get_market_data():
 
         data.append({
             "name": name,
+            "ticker": ticker,
             "price": last,
             "change_pct": change_pct,
             "signal": signal
@@ -137,6 +397,15 @@ def calc_rsi(close, length=14):
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
+def as_series(value):
+    if isinstance(value, pd.DataFrame):
+        return value.iloc[:, 0]
+    return value
+
+def series_float(series, index):
+    value = series.iloc[index]
+    return float(value.iloc[0]) if hasattr(value, "iloc") else float(value)
 
 def get_price_structure(df, timeframe):
     interval_minutes = {"15m": 15, "30m": 30, "1h": 60}
@@ -264,6 +533,191 @@ def get_snapshot_trend(now, prev1, prev2):
         return "↓ Weakening"
     return "→ Flat"
 
+def get_monitor_score(data_15m, data_1h):
+    score = 0
+    reasons = []
+
+    if data_15m:
+        if data_15m["now"] >= 50:
+            score += 2
+            reasons.append("15m RSI bullish")
+        if data_15m["now"] > data_15m["prev1"]:
+            score += 2
+            reasons.append("15m RSI improving")
+        if data_15m["structure_score"] > 0:
+            score += 1
+            reasons.append("15m HH/HL positive")
+
+    if data_1h:
+        if data_1h["now"] >= 50:
+            score += 2
+            reasons.append("1H RSI bullish")
+        if data_1h["now"] > data_1h["prev1"]:
+            score += 2
+            reasons.append("1H RSI improving")
+
+    if data_15m and data_1h and data_15m["now"] > data_15m["prev1"] and data_1h["now"] > data_1h["prev1"]:
+        score += 1
+        reasons.append("15m and 1H aligned")
+
+    return min(score, 10), ", ".join(reasons) if reasons else "No bullish confirmation yet"
+
+def get_bottom_timeframe_data(ticker, timeframe):
+    config = RSI_TIMEFRAMES[timeframe]
+    df = yf.download(
+        ticker,
+        period=config["period"],
+        interval=config["interval"],
+        progress=False,
+        auto_adjust=True
+    )
+
+    if df.empty:
+        return None
+
+    open_price = as_series(df["Open"])
+    low = as_series(df["Low"])
+    close = as_series(df["Close"])
+    rsi = calc_rsi(close).dropna()
+    rsi_ma = rsi.rolling(14).mean().dropna()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+
+    if len(rsi) < 3 or len(rsi_ma) < 2 or len(ema21) < 2 or len(close) < 2:
+        return None
+
+    now = series_float(rsi, -1)
+    prev1 = series_float(rsi, -2)
+    current_rsi_ma = series_float(rsi_ma, -1)
+    previous_rsi_ma = series_float(rsi_ma, -2)
+    current_close = series_float(close, -1)
+    previous_close = series_float(close, -2)
+    current_ema21 = series_float(ema21, -1)
+    previous_ema21 = series_float(ema21, -2)
+    current_open = series_float(open_price, -1)
+    current_low = series_float(low, -1)
+    previous_low = series_float(low, -2)
+    price_vs_ema_pct = (current_close - current_ema21) / current_ema21 * 100
+
+    if now > prev1:
+        trend = "Rising"
+    elif now < prev1:
+        trend = "Falling"
+    else:
+        trend = "Flat"
+
+    return {
+        "price": current_close,
+        "rsi": now,
+        "rsi_ma": current_rsi_ma,
+        "rsi_rising": now > prev1,
+        "rsi_above_50": now > 50,
+        "crossed_above_rsi_ma": prev1 <= previous_rsi_ma and now > current_rsi_ma,
+        "price_reclaimed_ema21": previous_close <= previous_ema21 and current_close > current_ema21,
+        "price_above_ema21": current_close > current_ema21,
+        "higher_low_detected": current_low > previous_low,
+        "bullish_candle": current_close > current_open,
+        "price_vs_ema21": (
+            f"Above EMA21 by {price_vs_ema_pct:.2f}%"
+            if current_close >= current_ema21
+            else f"Below EMA21 by {abs(price_vs_ema_pct):.2f}%"
+        ),
+        "trend": trend,
+    }
+
+def get_bottom_signal(ticker):
+    data_15m = get_bottom_timeframe_data(ticker, "15m")
+    data_1h = get_bottom_timeframe_data(ticker, "1h")
+    score = 0
+    reasons = []
+
+    if data_15m:
+        if data_15m["rsi_rising"]:
+            score += 1
+            reasons.append("15m RSI rising")
+        if data_15m["rsi_above_50"]:
+            score += 1
+            reasons.append("15m RSI above 50")
+        if data_15m["crossed_above_rsi_ma"]:
+            score += 2
+            reasons.append("15m RSI crossed above RSI MA")
+        if data_15m["price_above_ema21"]:
+            score += 2
+            reasons.append("price above EMA21")
+        if data_15m["higher_low_detected"]:
+            score += 1
+            reasons.append("higher low detected")
+
+    if data_1h:
+        if data_1h["rsi_rising"]:
+            score += 1
+            reasons.append("1H RSI rising")
+        if data_1h["rsi_above_50"]:
+            score += 2
+            reasons.append("1H RSI above 50")
+
+    score = min(score, 10)
+    if reasons:
+        reason = ", ".join(reasons[:3])
+        if score >= 8 and data_1h and data_1h["rsi_above_50"]:
+            reason = f"{reason}, higher-timeframe confirmation"
+        elif score >= 5:
+            reason = f"{reason}, good watch candidate"
+            if data_1h and not data_1h["rsi_above_50"]:
+                reason = f"{reason}; 1H RSI still below 50"
+    elif data_15m and data_15m["rsi"] < data_15m["rsi_ma"]:
+        reason = "Weak signal: RSI still below MA"
+    else:
+        reason = "Weak signal: no bottom confirmation yet"
+
+    return {
+        "ticker": ticker,
+        "price": data_15m["price"] if data_15m else data_1h["price"] if data_1h else None,
+        "score": score,
+        "reason": reason,
+        "rsi_15m": data_15m["rsi"] if data_15m else None,
+        "rsi_1h": data_1h["rsi"] if data_1h else None,
+        "price_vs_ema21": data_15m["price_vs_ema21"] if data_15m else "N/A",
+        "rsi_trend": (
+            f"15m: {data_15m['trend'] if data_15m else 'N/A'} / "
+            f"1H: {data_1h['trend'] if data_1h else 'N/A'}"
+        ),
+    }
+
+def safe_float(value, default=0):
+    try:
+        return float(str(value).replace(",", "").replace("'", ""))
+    except (TypeError, ValueError):
+        return default
+
+def get_position_details(ticker, price, portfolio):
+    position = portfolio.get(ticker, {})
+    shares = safe_float(position.get("shares", 0))
+    average_price = safe_float(
+        position.get("average_price", position.get("avg_price", 0))
+    )
+    currency = position.get("account_currency", position.get("currency", ""))
+
+    if shares <= 0:
+        return {
+            "owned": False,
+            "position": "-",
+            "shares": "-",
+            "avg_cost": "-",
+            "pl_pct": "-",
+        }
+
+    pl_pct = None
+    if average_price > 0 and price is not None:
+        pl_pct = (price - average_price) / average_price * 100
+
+    return {
+        "owned": True,
+        "position": f"{shares:g}",
+        "shares": f"{shares:g}",
+        "avg_cost": f"{average_price:.2f} {currency}".strip(),
+        "pl_pct": f"{pl_pct:+.2f}%" if pl_pct is not None else "-",
+    }
+
 def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
     if timeframe not in RSI_TIMEFRAMES:
         timeframe = "15m"
@@ -271,6 +725,8 @@ def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
     timeframe_label = RSI_TIMEFRAMES[timeframe]["label"]
     data = []
     monitors = load_monitors()
+    portfolio = load_portfolio()
+    earnings_cache = load_earnings_cache()
 
     for ticker in watchlist:
         result = get_rsi_data(ticker, timeframe)
@@ -305,10 +761,14 @@ def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
 
         monitor_status = monitors.get(d["ticker"], "OFF")
         monitor_color = "#2e7d32" if monitor_status == "ON" else "#777"
+        position = get_position_details(d["ticker"], d["price"], portfolio)
+        earnings = get_earnings_info(d["ticker"], earnings_cache)
+        ticker_style = "font-weight:bold;color:#0f5132;" if position["owned"] else ""
+        owned_style = "outline:2px solid #86efac;" if position["owned"] else ""
         rows += f"""
         
-        <tr style="background-color:{color}">
-            <td>{d['ticker']}</td>
+        <tr style="background-color:{color};{owned_style}">
+            <td style="{ticker_style}">{d['ticker']}</td>
             <td>
                 <a class="snapshot-button" href="/snapshot/{urllib.parse.quote(d['ticker'])}?return_to={urllib.parse.quote(dashboard_path)}&timeframe={timeframe}">
                     Snapshot
@@ -322,6 +782,10 @@ def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
                 </form>
             </td>
             <td>{d['price']:.2f}</td>
+            <td>{position['position']}</td>
+            <td>{position['avg_cost']}</td>
+            <td>{position['pl_pct']}</td>
+            <td style="{earnings['style']}">{earnings['date_text']}</td>
             <td>{d['now']:.2f}</td>
             <td>{d['setup']}</td>
             <td>{d['prev1']:.2f}</td>
@@ -333,6 +797,7 @@ def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
         </tr>
         """
 
+    save_earnings_cache(earnings_cache)
     updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     return f"""
@@ -389,6 +854,10 @@ def build_dashboard(title, watchlist, dashboard_path, timeframe="15m"):
                 <th>Multi-Timeframe</th>
                 <th>Monitor</th>
                 <th>Price</th>
+                <th>Position</th>
+                <th>Avg Cost</th>
+                <th>Unrealized P/L %</th>
+                <th>Earnings Date</th>
                 <th>RSI {timeframe_label}</th>
                 <th>Setup</th>
                 <th>Previous Bar</th>
@@ -614,6 +1083,217 @@ def multi_timeframe_snapshot(
     </html>
     """
 
+@app.get("/monitors", response_class=HTMLResponse)
+def monitors_page():
+    monitors = load_monitors()
+    portfolio = load_portfolio()
+    earnings_cache = load_earnings_cache()
+    monitored_tickers = sorted(
+        ticker.upper()
+        for ticker, status in monitors.items()
+        if status == "ON"
+    )
+    rows_data = []
+
+    for ticker in monitored_tickers:
+        rows_data.append(get_bottom_signal(ticker))
+
+    rows_data.sort(key=lambda row: (-row["score"], row["ticker"]))
+    rows = ""
+
+    for row in rows_data:
+        score = row["score"]
+        color = "#dcfce7" if score >= 8 else "#fef9c3" if score >= 5 else "#fee2e2"
+        price = f"{row['price']:.2f}" if row["price"] is not None else "N/A"
+        rsi_15m = f"{row['rsi_15m']:.2f}" if row["rsi_15m"] is not None else "N/A"
+        rsi_1h = f"{row['rsi_1h']:.2f}" if row["rsi_1h"] is not None else "N/A"
+        position = get_position_details(row["ticker"], row["price"], portfolio)
+        earnings = get_earnings_info(row["ticker"], earnings_cache)
+        reason = row["reason"]
+        if earnings["reason"]:
+            reason = f"{reason}, {earnings['reason']}"
+        ticker_style = "font-weight:bold;color:#0f5132;" if position["owned"] else ""
+        owned_style = "outline:2px solid #86efac;" if position["owned"] else ""
+        safe_ticker = html.escape(row["ticker"])
+
+        rows += f"""
+        <tr style="background:{color};{owned_style}">
+            <td style="{ticker_style}">{safe_ticker}</td>
+            <td>
+                <form method="post" action="/monitor?ticker={urllib.parse.quote(row['ticker'])}&return_to=/monitors">
+                    <button type="submit" class="monitor-button">ON</button>
+                </form>
+            </td>
+            <td><strong>{score}/10</strong></td>
+            <td class="reason">{html.escape(reason)}</td>
+            <td>{price}</td>
+            <td>{position['position']}</td>
+            <td>{position['avg_cost']}</td>
+            <td>{position['pl_pct']}</td>
+            <td style="{earnings['style']}">{earnings['date_text']}</td>
+            <td>{rsi_15m}</td>
+            <td>{rsi_1h}</td>
+            <td>{html.escape(row['price_vs_ema21'])}</td>
+            <td>{html.escape(row['rsi_trend'])}</td>
+        </tr>
+        """
+
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="13">No tickers are currently being monitored.</td>
+        </tr>
+        """
+
+    save_earnings_cache(earnings_cache)
+    updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return f"""
+    <html>
+    <head>
+        <meta http-equiv="refresh" content="60">
+        <style>
+            body {{ font-family: Arial; margin: 30px; }}
+            table {{ border-collapse: collapse; width: 100%; }}
+            th, td {{ border: 1px solid #ccc; padding: 10px; text-align: center; }}
+            th {{ background: #eee; }}
+            a {{ font-size: 18px; margin-right: 10px; }}
+            .reason {{ text-align: left; }}
+            .monitor-button {{
+                background: #2e7d32;
+                color: white;
+                border: 0;
+                padding: 6px 12px;
+                cursor: pointer;
+            }}
+        </style>
+    </head>
+    <body>
+        {nav()}
+
+        <h2>Bottom Signal</h2>
+        <p>Updated: {updated}</p>
+        <table>
+            <tr>
+                <th>Ticker</th>
+                <th>Monitor</th>
+                <th>Bottom Score</th>
+                <th>Reason</th>
+                <th>Price</th>
+                <th>Position</th>
+                <th>Avg Cost</th>
+                <th>Unrealized P/L %</th>
+                <th>Earnings Date</th>
+                <th>15m RSI</th>
+                <th>1H RSI</th>
+                <th>Price vs EMA21</th>
+                <th>RSI Trend</th>
+            </tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
+
+@app.get("/portfolio", response_class=HTMLResponse)
+def portfolio_page(imported: int = 0, error: str = ""):
+    portfolio = load_portfolio()
+    earnings_cache = load_earnings_cache()
+    rows = ""
+
+    for ticker, position in sorted(portfolio.items()):
+        shares = safe_float(position.get("shares"))
+        average_price = safe_float(position.get("average_price", position.get("avg_price")))
+        currency = position.get("account_currency", position.get("currency", ""))
+        notes = position.get("notes", "")
+        earnings = get_earnings_info(ticker, earnings_cache)
+
+        rows += f"""
+        <tr>
+            <td>{html.escape(ticker)}</td>
+            <td>{shares:g}</td>
+            <td>{average_price:.2f}</td>
+            <td>{html.escape(str(currency))}</td>
+            <td style="{earnings['style']}">{earnings['date_text']}</td>
+            <td>{html.escape(str(notes))}</td>
+        </tr>
+        """
+
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="6">No portfolio holdings imported yet.</td>
+        </tr>
+        """
+
+    save_earnings_cache(earnings_cache)
+    csv_status = "Found" if os.path.exists(PORTFOLIO_CSV_FILE) else "Missing"
+    csv_rows = count_portfolio_csv_rows()
+    message = ""
+
+    if imported:
+        message = f"<p><strong>Imported {imported} holding(s) from {PORTFOLIO_CSV_FILE}.</strong></p>"
+    elif error:
+        message = f"<p><strong>{html.escape(error)}</strong></p>"
+    elif csv_rows == 0:
+        message = f"<p><strong>{PORTFOLIO_CSV_FILE} has no holdings yet. Add rows, then import again.</strong></p>"
+
+    return f"""
+    <html>
+    <head>
+        <style>
+            body {{ font-family: Arial; margin: 30px; }}
+            table {{ border-collapse: collapse; width: 100%; margin-top: 16px; }}
+            th, td {{ border: 1px solid #ccc; padding: 10px; text-align: center; }}
+            th {{ background: #eee; }}
+            a {{ font-size: 18px; margin-right: 10px; }}
+            button {{
+                background: #1565c0;
+                color: white;
+                border: 0;
+                padding: 8px 14px;
+                cursor: pointer;
+            }}
+            .hint {{ color: #555; }}
+        </style>
+    </head>
+    <body>
+        {nav()}
+
+        <h2>Portfolio</h2>
+        <p class="hint">CSV file: {PORTFOLIO_CSV_FILE} ({csv_status}, {csv_rows} holding row(s))</p>
+        <p class="hint">Expected columns: ticker, shares, average_price, account_currency, notes</p>
+        {message}
+        <form method="post" action="/portfolio/import-csv">
+            <button type="submit">Import CSV into portfolio.json</button>
+        </form>
+
+        <table>
+            <tr>
+                <th>Ticker</th>
+                <th>Shares</th>
+                <th>Avg Cost</th>
+                <th>Currency</th>
+                <th>Earnings Date</th>
+                <th>Notes</th>
+            </tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
+
+@app.post("/portfolio/import-csv")
+def import_portfolio_csv():
+    portfolio = load_portfolio_csv()
+
+    if not portfolio:
+        error = urllib.parse.quote(f"No holdings found in {PORTFOLIO_CSV_FILE}")
+        return RedirectResponse(f"/portfolio?error={error}", status_code=303)
+
+    save_portfolio(portfolio)
+    return RedirectResponse(f"/portfolio?imported={len(portfolio)}", status_code=303)
+
 @app.post("/monitor")
 def toggle_monitor(ticker: str, return_to: str = "/dashboard", timeframe: str = "15m"):
     monitors = load_monitors()
@@ -624,11 +1304,14 @@ def toggle_monitor(ticker: str, return_to: str = "/dashboard", timeframe: str = 
     if monitors[ticker] == "ON":
         log_monitor_on(ticker)
 
-    if return_to not in ("/dashboard", "/dashboard2", "/dashboard3"):
+    if return_to not in ("/dashboard", "/dashboard2", "/dashboard3", "/monitors"):
         return_to = "/dashboard"
 
     if timeframe not in RSI_TIMEFRAMES:
         timeframe = "15m"
+
+    if return_to == "/monitors":
+        return RedirectResponse(return_to, status_code=303)
 
     return RedirectResponse(f"{return_to}?timeframe={timeframe}", status_code=303)
 
@@ -647,15 +1330,22 @@ def dashboard3(timeframe: str = "15m"):
 @app.get("/market", response_class=HTMLResponse)
 def market():
     data = get_market_data()
+    portfolio = load_portfolio()
     updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     rows = ""
 
     for d in data:
+        position = get_position_details(d["ticker"], d["price"], portfolio)
+        ticker_style = "font-weight:bold;color:#0f5132;" if position["owned"] else ""
+        owned_style = "outline:2px solid #86efac;" if position["owned"] else ""
         rows += f"""
-        <tr>
-            <td>{d['name']}</td>
+        <tr style="{owned_style}">
+            <td style="{ticker_style}">{d['name']}</td>
             <td>{d['price']:.2f}</td>
+            <td>{position['position']}</td>
+            <td>{position['avg_cost']}</td>
+            <td>{position['pl_pct']}</td>
             <td>{d['change_pct']:+.2f}%</td>
             <td>{d['signal']}</td>
         </tr>
@@ -683,6 +1373,9 @@ def market():
             <tr>
                 <th>Market</th>
                 <th>Price</th>
+                <th>Position</th>
+                <th>Avg Cost</th>
+                <th>Unrealized P/L %</th>
                 <th>Daily Change</th>
                 <th>Signal</th>
             </tr>
