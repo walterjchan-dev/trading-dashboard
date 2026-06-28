@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 
-git add main.py monitor.json requirements.txt Procfile watchlist1.txt watchlist2.txt watchlist3.txt launch.bat deploy-github.bat
+git add main.py monitor.json portfolio.json portfolio.csv requirements.txt Procfile watchlist1.txt watchlist2.txt watchlist3.txt launch.bat deploy-github.bat
 if errorlevel 1 goto error
 
 set "MESSAGE=%~1"

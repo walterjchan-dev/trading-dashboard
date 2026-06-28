@@ -1,0 +1,37 @@
+{
+  "ASX": {
+    "shares": 5.0,
+    "average_price": 40.41,
+    "currency": "USD"
+  },
+  "CRDO": {
+    "shares": 2.0,
+    "average_price": 264.265,
+    "currency": "USD"
+  },
+  "JNJ": {
+    "shares": 6.0,
+    "average_price": 211.228,
+    "currency": "USD"
+  },
+  "MRK": {
+    "shares": 4.0,
+    "average_price": 119.74,
+    "currency": "USD"
+  },
+  "NVDA": {
+    "shares": 1.0,
+    "average_price": 209.62,
+    "currency": "USD"
+  },
+  "PG": {
+    "shares": 6.0,
+    "average_price": 146.979,
+    "currency": "USD"
+  },
+  "UNH": {
+    "shares": 2.5,
+    "average_price": 392.964,
+    "currency": "USD"
+  }
+}
