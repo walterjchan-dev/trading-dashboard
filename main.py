@@ -689,6 +689,46 @@ def safe_float(value, default=0):
     except (TypeError, ValueError):
         return default
 
+def get_payload_value(payload, *names):
+    for name in names:
+        value = payload.get(name)
+        if value not in (None, ""):
+            return value
+
+    lowered_names = {name.lower() for name in names}
+    for key, value in payload.items():
+        if str(key).lower() in lowered_names and value not in (None, ""):
+            return value
+
+    return None
+
+def format_payload_number(value, decimals=2):
+    number = safe_float(value, None)
+    if number is None:
+        return str(value) if value not in (None, "") else None
+
+    return f"{number:.{decimals}f}"
+
+def format_payload_score(value):
+    number = safe_float(value, None)
+    if number is None:
+        return str(value) if value not in (None, "") else None
+
+    return f"{number:g}/10"
+
+def get_webhook_score(payload, signal):
+    raw_score = get_payload_value(payload, "score")
+    score = safe_float(raw_score, None)
+
+    if score and score > 0:
+        return score
+
+    signal_text = str(signal or "").upper()
+    if "MOMENTUM" in signal_text:
+        return 7
+
+    return score
+
 def get_position_details(ticker, price, portfolio):
     position = portfolio.get(ticker, {})
     shares = safe_float(position.get("shares", 0))
@@ -880,30 +920,56 @@ async def webhook(request: Request):
     except Exception:
         return {"ok": False, "error": "Invalid JSON"}
 
-    ticker = payload.get("ticker", "")
-    signal = payload.get("signal", "")
-    price = payload.get("price", "")
-    timeframe = payload.get("timeframe", "")
+    ticker = str(get_payload_value(payload, "ticker", "symbol") or "").upper()
+    signal = get_payload_value(payload, "signal")
+    price = get_payload_value(payload, "price")
+    timeframe = get_payload_value(payload, "timeframe", "interval")
+    score = format_payload_score(get_webhook_score(payload, signal))
 
-    lines = [f"{ticker} - {signal}", f"Price: {price}"]
+    lines = ["Trading Dashboard Alert", ""]
+    if ticker:
+        lines.append(f"Ticker: {ticker}")
+    if timeframe:
+        lines.append(f"Timeframe: {timeframe}")
+    if price not in (None, ""):
+        lines.append(f"Price: {price}")
+
+    if signal:
+        lines.extend(["", "Signal:", str(signal)])
+
     optional_fields = (
-        ("Timeframe", timeframe),
-        ("RSI", payload.get("rsi")),
-        ("RSI MA", payload.get("rsi_ma")),
-        ("EMA21", payload.get("ema21")),
-        ("BB Upper", payload.get("bb_upper")),
-        ("BB Lower", payload.get("bb_lower")),
-        ("BB Distance", payload.get("bb_distance")),
-        ("ATR", payload.get("atr")),
-        ("Volume", payload.get("volume")),
-        ("Bar Time", payload.get("bar_time")),
+        ("RSI", format_payload_number(get_payload_value(payload, "rsi"))),
+        ("RSI MA", format_payload_number(get_payload_value(payload, "rsi_ma"))),
+        ("EMA21", format_payload_number(get_payload_value(payload, "ema21"))),
+        ("BB Upper", format_payload_number(get_payload_value(payload, "bb_upper"))),
+        ("BB Lower", format_payload_number(get_payload_value(payload, "bb_lower"))),
+        ("BB Distance", format_payload_number(get_payload_value(payload, "bb_distance"))),
+        ("ATR", format_payload_number(get_payload_value(payload, "atr"))),
+        ("Volume", get_payload_value(payload, "volume")),
+        ("Bar Time", get_payload_value(payload, "bar_time")),
+        ("Score", score),
     )
 
-    lines.extend(
-        f"{label}: {value}"
-        for label, value in optional_fields
-        if value not in (None, "")
-    )
+    if any(value not in (None, "") for _, value in optional_fields):
+        lines.append("")
+        lines.extend(
+            f"{label}: {value}"
+            for label, value in optional_fields
+            if value not in (None, "")
+        )
+
+    if ticker:
+        price_number = safe_float(price, None)
+        position = get_position_details(ticker, price_number, load_portfolio())
+        if position["owned"]:
+            position_text = (
+                f"Held: {position['shares']} shares, "
+                f"avg {position['avg_cost']}, P/L {position['pl_pct']}"
+            )
+        else:
+            position_text = "Not currently held / watchlist only."
+        lines.extend(["", f"Position: {position_text}"])
+
     send_telegram_message("\n".join(lines))
 
     return {"ok": True, "received": payload}
