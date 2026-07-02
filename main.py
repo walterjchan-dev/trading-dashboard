@@ -12,10 +12,13 @@ import urllib.request
 
 app = FastAPI()
 MONITOR_FILE = "monitor.json"
+GAP_ALERTS_FILE = "gap_alerts.json"
 PORTFOLIO_FILE = "portfolio.json"
 PORTFOLIO_CSV_FILE = "portfolio.csv"
 EARNINGS_CACHE_FILE = "earnings_cache.json"
 EARNINGS_CACHE_TTL = timedelta(hours=24)
+GAP_UP_THRESHOLD_PCT = 3.0
+GAP_SUPPORT_NEAR_PCT = 0.75
 
 def load_monitors():
     try:
@@ -27,6 +30,19 @@ def load_monitors():
 def save_monitors(monitors):
     with open(MONITOR_FILE, "w") as f:
         json.dump(monitors, f, indent=2)
+
+def load_gap_alerts():
+    try:
+        with open(GAP_ALERTS_FILE, "r") as f:
+            alerts = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+    return alerts if isinstance(alerts, dict) else {}
+
+def save_gap_alerts(alerts):
+    with open(GAP_ALERTS_FILE, "w") as f:
+        json.dump(alerts, f, indent=2)
 
 def load_portfolio():
     try:
@@ -334,6 +350,7 @@ def nav():
         <a href="/dashboard2">Watchlist 2</a> |
         <a href="/dashboard3">Watchlist 3</a> |
         <a href="/monitors">Monitors</a> |
+        <a href="/gap-up">Gap-Up Monitor</a> |
         <a href="/portfolio">Portfolio</a> |
         <a href="/market">Market Overview</a>
     </div>
@@ -406,6 +423,236 @@ def as_series(value):
 def series_float(series, index):
     value = series.iloc[index]
     return float(value.iloc[0]) if hasattr(value, "iloc") else float(value)
+
+def unique_watchlist_tickers():
+    tickers = []
+    seen = set()
+
+    for filename in ("watchlist1.txt", "watchlist2.txt", "watchlist3.txt"):
+        for ticker in load_watchlist(filename):
+            if ticker not in seen:
+                tickers.append(ticker)
+                seen.add(ticker)
+
+    return tickers
+
+def get_previous_regular_close(ticker):
+    daily = yf.download(
+        ticker,
+        period="10d",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+    )
+
+    if daily.empty:
+        return None, None
+
+    close = as_series(daily["Close"]).dropna()
+    if close.empty:
+        return None, None
+
+    today = date.today()
+    historical_close = close[close.index.date < today]
+    if historical_close.empty:
+        historical_close = close.iloc[:-1]
+
+    if historical_close.empty:
+        return None, None
+
+    previous_close = float(historical_close.iloc[-1])
+    previous_date = pd.Timestamp(historical_close.index[-1]).date()
+    return previous_close, previous_date
+
+def get_gap_up_data(ticker):
+    daily = yf.download(
+        ticker,
+        period="30d",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+    )
+
+    if daily.empty:
+        return None
+
+    close_daily = as_series(daily["Close"]).dropna()
+    if close_daily.empty:
+        return None
+
+    today = date.today()
+    historical_close = close_daily[close_daily.index.date < today]
+    if historical_close.empty:
+        historical_close = close_daily.iloc[:-1]
+
+    if historical_close.empty:
+        return None
+
+    previous_close = float(historical_close.iloc[-1])
+    previous_date = pd.Timestamp(historical_close.index[-1]).date()
+    if previous_close is None or previous_close <= 0:
+        return None
+
+    intraday = yf.download(
+        ticker,
+        period="5d",
+        interval="5m",
+        prepost=True,
+        progress=False,
+        auto_adjust=False,
+    )
+
+    if intraday.empty:
+        return None
+
+    open_price = as_series(intraday["Open"]).dropna()
+    high = as_series(intraday["High"]).dropna()
+    low = as_series(intraday["Low"]).dropna()
+    close = as_series(intraday["Close"]).dropna()
+    volume = as_series(intraday["Volume"]).fillna(0)
+
+    if close.empty or low.empty:
+        return None
+
+    latest_date = pd.Timestamp(close.index[-1]).date()
+    date_mask = close.index.date == latest_date
+    today_close = close[date_mask]
+    today_low = low[low.index.date == latest_date]
+    today_high = high[high.index.date == latest_date]
+    today_open = open_price[open_price.index.date == latest_date]
+    today_volume = volume[volume.index.date == latest_date]
+
+    if today_close.empty or today_low.empty or today_volume.empty:
+        return None
+
+    current_price = float(today_close.iloc[-1])
+    first_price = float(today_open.iloc[0]) if not today_open.empty else current_price
+    gap_price = first_price if first_price > 0 else current_price
+    gap_pct = (gap_price - previous_close) / previous_close * 100
+
+    typical_price = (
+        today_high.reindex(today_close.index).ffill()
+        + today_low.reindex(today_close.index).ffill()
+        + today_close
+    ) / 3
+    cumulative_volume = today_volume.reindex(today_close.index).fillna(0).cumsum()
+    cumulative_value = (typical_price * today_volume.reindex(today_close.index).fillna(0)).cumsum()
+    vwap = None
+    if not cumulative_volume.empty and float(cumulative_volume.iloc[-1]) > 0:
+        vwap = float(cumulative_value.iloc[-1] / cumulative_volume.iloc[-1])
+
+    ema22 = float(today_close.ewm(span=22, adjust=False).mean().iloc[-1])
+    rsi_values = calc_rsi(today_close).dropna()
+    rsi = float(rsi_values.iloc[-1]) if not rsi_values.empty else None
+    intraday_volume = int(today_volume.sum())
+
+    avg_daily_volume = None
+    volume_strong = False
+    daily_volume = as_series(daily["Volume"]).dropna()
+    historical_volume = daily_volume[daily_volume.index.date < latest_date]
+    if not historical_volume.empty:
+        avg_daily_volume = float(historical_volume.tail(20).mean())
+        elapsed_fraction = min(max(len(today_volume) * 5 / 390, 0.05), 1)
+        expected_volume = avg_daily_volume * elapsed_fraction
+        volume_strong = intraday_volume >= expected_volume * 1.2
+
+    support_values = [value for value in (vwap, ema22) if value and value > 0]
+    support_level = min(support_values) if support_values else None
+    low_today = float(today_low.min())
+    above_ema22 = current_price >= ema22
+    above_vwap = vwap is not None and current_price >= vwap
+    rsi_above_50 = rsi is not None and rsi >= 50
+    near_support = (
+        support_level is not None
+        and low_today <= support_level * (1 + GAP_SUPPORT_NEAR_PCT / 100)
+    )
+    reclaimed_support = near_support and above_vwap and above_ema22
+    gap_up = gap_pct >= GAP_UP_THRESHOLD_PCT
+
+    if not gap_up:
+        status = "NO GAP"
+    elif current_price <= previous_close or (not above_vwap and not above_ema22):
+        status = "GAP FAILED"
+    elif reclaimed_support and rsi_above_50 and volume_strong:
+        status = "PULLBACK BUY WATCH"
+    elif current_price >= gap_price and rsi_above_50:
+        status = "GAP HELD"
+    else:
+        status = "GAP UP WATCH"
+
+    reasons = []
+    reasons.append(
+        f"Gap up {gap_pct:+.2f}%"
+        if gap_up
+        else f"Gap below threshold at {gap_pct:+.2f}%"
+    )
+    reasons.append("Volume above normal" if volume_strong else "Volume not above normal yet")
+    reasons.append("Above EMA22" if above_ema22 else "Below EMA22")
+    reasons.append("Above VWAP" if above_vwap else "Below VWAP")
+    reasons.append("RSI above 50" if rsi_above_50 else "RSI below 50")
+    if gap_up and status == "GAP UP WATCH":
+        reasons.append("Wait for pullback to VWAP / EMA22")
+    if status == "PULLBACK BUY WATCH":
+        reasons.append("Pulled back near support and reclaimed VWAP / EMA22")
+
+    return {
+        "ticker": ticker,
+        "status": status,
+        "gap_pct": gap_pct,
+        "gap_price": gap_price,
+        "current_price": current_price,
+        "previous_close": previous_close,
+        "previous_date": previous_date,
+        "intraday_volume": intraday_volume,
+        "avg_daily_volume": avg_daily_volume,
+        "volume_strong": volume_strong,
+        "vwap": vwap,
+        "ema22": ema22,
+        "rsi": rsi,
+        "above_vwap": above_vwap,
+        "above_ema22": above_ema22,
+        "near_support": near_support,
+        "reclaimed_support": reclaimed_support,
+        "reasons": reasons,
+    }
+
+def format_compact_volume(value):
+    if value is None:
+        return "N/A"
+
+    number = float(value)
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.2f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}K"
+    return f"{number:.0f}"
+
+def should_send_gap_alert(row, alert_memory):
+    if row["status"] not in ("GAP UP WATCH", "PULLBACK BUY WATCH"):
+        return False
+
+    key = row["ticker"]
+    current_state = f"{date.today().isoformat()}:{row['status']}:{row['gap_pct']:.2f}"
+    if alert_memory.get(key) == current_state:
+        return False
+
+    alert_memory[key] = current_state
+    return True
+
+def send_gap_alert(row):
+    lines = [
+        "GAP-UP MONITOR",
+        f"Ticker: {row['ticker']}",
+        f"Gap: {row['gap_pct']:+.2f}%",
+        f"Current price: {row['current_price']:.2f}",
+        f"Previous close: {row['previous_close']:.2f}",
+        "",
+        f"Status: {row['status']}",
+        "",
+        "Reasons:",
+    ]
+    lines.extend(f"- {reason}" for reason in row["reasons"])
+    send_telegram_message("\n".join(lines))
 
 def get_price_structure(df, timeframe):
     interval_minutes = {"15m": 15, "30m": 30, "1h": 60}
@@ -1275,6 +1522,123 @@ def monitors_page():
                 <th>1H RSI</th>
                 <th>Price vs EMA21</th>
                 <th>RSI Trend</th>
+            </tr>
+            {rows}
+        </table>
+    </body>
+    </html>
+    """
+
+@app.get("/gap-up", response_class=HTMLResponse)
+def gap_up_page():
+    alert_memory = load_gap_alerts()
+    portfolio = load_portfolio()
+    rows_data = []
+
+    for ticker in unique_watchlist_tickers():
+        row = get_gap_up_data(ticker)
+        if row and row["status"] != "NO GAP":
+            rows_data.append(row)
+            if should_send_gap_alert(row, alert_memory):
+                send_gap_alert(row)
+
+    save_gap_alerts(alert_memory)
+
+    status_rank = {
+        "PULLBACK BUY WATCH": 0,
+        "GAP HELD": 1,
+        "GAP UP WATCH": 2,
+        "GAP FAILED": 3,
+    }
+    rows_data.sort(key=lambda row: (status_rank.get(row["status"], 9), -row["gap_pct"], row["ticker"]))
+
+    rows = ""
+    for row in rows_data:
+        status = row["status"]
+        color = {
+            "PULLBACK BUY WATCH": "#dcfce7",
+            "GAP HELD": "#dbeafe",
+            "GAP UP WATCH": "#fef9c3",
+            "GAP FAILED": "#fee2e2",
+        }.get(status, "#f5f5f5")
+        price = row["current_price"]
+        position = get_position_details(row["ticker"], price, portfolio)
+        ticker_style = "font-weight:bold;color:#0f5132;" if position["owned"] else ""
+        owned_style = "outline:2px solid #86efac;" if position["owned"] else ""
+        rsi = f"{row['rsi']:.2f}" if row["rsi"] is not None else "N/A"
+        vwap = f"{row['vwap']:.2f}" if row["vwap"] is not None else "N/A"
+        avg_volume = format_compact_volume(row["avg_daily_volume"])
+        reasons = "<br>".join(html.escape(reason) for reason in row["reasons"])
+
+        rows += f"""
+        <tr style="background:{color};{owned_style}">
+            <td style="{ticker_style}">{html.escape(row['ticker'])}</td>
+            <td><strong>{html.escape(status)}</strong></td>
+            <td>{row['gap_pct']:+.2f}%</td>
+            <td>{row['current_price']:.2f}</td>
+            <td>{row['gap_price']:.2f}</td>
+            <td>{row['previous_close']:.2f}</td>
+            <td>{format_compact_volume(row['intraday_volume'])}</td>
+            <td>{avg_volume}</td>
+            <td>{vwap}</td>
+            <td>{row['ema22']:.2f}</td>
+            <td>{rsi}</td>
+            <td>{position['position']}</td>
+            <td>{position['pl_pct']}</td>
+            <td class="reason">{reasons}</td>
+        </tr>
+        """
+
+    if not rows:
+        rows = """
+        <tr>
+            <td colspan="14">No watchlist tickers are gapping up more than 3% right now.</td>
+        </tr>
+        """
+
+    updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return f"""
+    <html>
+    <head>
+        <meta http-equiv="refresh" content="60">
+        <style>
+            body {{ font-family: Arial; margin: 30px; }}
+            table {{ border-collapse: collapse; width: 100%; }}
+            th, td {{ border: 1px solid #ccc; padding: 10px; text-align: center; }}
+            th {{ background: #eee; }}
+            a {{ font-size: 18px; margin-right: 10px; }}
+            .reason {{ text-align: left; min-width: 220px; }}
+            .note {{ color: #555; max-width: 900px; line-height: 1.4; }}
+        </style>
+    </head>
+    <body>
+        {nav()}
+
+        <h2>Gap-Up Monitor</h2>
+        <p>Updated: {updated}</p>
+        <p class="note">
+            Flags watchlist tickers gapping up more than {GAP_UP_THRESHOLD_PCT:.0f}% from the previous regular-session close.
+            Telegram alerts are sent only for GAP UP WATCH and PULLBACK BUY WATCH. A pullback buy watch requires RSI above 50
+            and price holding/reclaiming VWAP and EMA22.
+        </p>
+
+        <table>
+            <tr>
+                <th>Ticker</th>
+                <th>Status</th>
+                <th>Gap</th>
+                <th>Current</th>
+                <th>Premarket/Open</th>
+                <th>Prev Close</th>
+                <th>Volume</th>
+                <th>Avg Volume</th>
+                <th>VWAP</th>
+                <th>EMA22</th>
+                <th>RSI</th>
+                <th>Position</th>
+                <th>P/L %</th>
+                <th>Reasons</th>
             </tr>
             {rows}
         </table>
