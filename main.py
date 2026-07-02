@@ -716,6 +716,21 @@ def format_payload_score(value):
 
     return f"{number:g}/10"
 
+def format_payload_bool(value):
+    if value in (None, ""):
+        return None
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "y"):
+        return "true"
+    if text in ("false", "0", "no", "n"):
+        return "false"
+
+    return str(value)
+
 def get_webhook_score(payload, signal):
     raw_score = get_payload_value(payload, "score")
     score = safe_float(raw_score, None)
@@ -948,6 +963,12 @@ async def webhook(request: Request):
         ("Volume", get_payload_value(payload, "volume")),
         ("Bar Time", get_payload_value(payload, "bar_time")),
         ("Score", score),
+        ("RSI Above MA", format_payload_bool(get_payload_value(payload, "rsi_above_ma"))),
+        ("RSI Above 50", format_payload_bool(get_payload_value(payload, "rsi_above_50"))),
+        ("Above EMA21", format_payload_bool(get_payload_value(payload, "above_ema21"))),
+        ("RSI Cross MA", format_payload_bool(get_payload_value(payload, "rsi_cross_ma"))),
+        ("RSI Cross 50", format_payload_bool(get_payload_value(payload, "rsi_cross_50"))),
+        ("Price Cross EMA", format_payload_bool(get_payload_value(payload, "price_cross_ema"))),
     )
 
     if any(value not in (None, "") for _, value in optional_fields):

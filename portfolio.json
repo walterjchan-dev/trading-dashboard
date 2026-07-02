@@ -4,9 +4,24 @@
     "average_price": 40.41,
     "currency": "USD"
   },
+  "BE": {
+    "shares": 1.0,
+    "average_price": 304.55,
+    "currency": "USD"
+  },
   "CRDO": {
+    "shares": 3.0,
+    "average_price": 258.394,
+    "currency": "USD"
+  },
+  "GOOG": {
+    "shares": 1.0,
+    "average_price": 358.921,
+    "currency": "USD"
+  },
+  "HOOD": {
     "shares": 2.0,
-    "average_price": 264.265,
+    "average_price": 107.601,
     "currency": "USD"
   },
   "JNJ": {
@@ -19,6 +34,11 @@
     "average_price": 119.74,
     "currency": "USD"
   },
+  "MSFT": {
+    "shares": 1.0,
+    "average_price": 385.301,
+    "currency": "USD"
+  },
   "NVDA": {
     "shares": 1.0,
     "average_price": 209.62,
@@ -27,6 +47,11 @@
   "PG": {
     "shares": 6.0,
     "average_price": 146.979,
+    "currency": "USD"
+  },
+  "RKLB": {
+    "shares": 2.0,
+    "average_price": 104.761,
     "currency": "USD"
   },
   "UNH": {
