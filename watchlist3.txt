@@ -6,3 +6,4 @@ RKLB
 HL
 HOOD
 CEG
+GDX
