@@ -606,7 +606,12 @@ def get_gap_up_data(ticker):
     pullback_score = min(pullback_score, 10)
 
     if not gap_up:
-        status = "NO GAP"
+        if gap_pct >= 2:
+            status = "NEAR THRESHOLD"
+        elif gap_pct > 0:
+            status = "WATCHING"
+        else:
+            status = "NO GAP"
     elif current_price <= previous_close or (not above_vwap and not above_ema22):
         status = "GAP FAILED"
     elif momentum_score >= 8 and reclaimed_support and rsi_above_50 and bullish_close:
@@ -627,6 +632,8 @@ def get_gap_up_data(ticker):
     reasons.append("Above VWAP" if above_vwap else "Below VWAP")
     reasons.append("RSI above 50" if rsi_above_50 else "RSI below 50")
     reasons.append(f"Momentum score {momentum_score}/10")
+    if not gap_up and gap_pct > 0:
+        reasons.append("Below alert threshold; shown for visibility only")
     if gap_up and status == "GAP UP WATCH":
         reasons.append("Wait for pullback to VWAP / EMA22")
     if status == "PULLBACK BUY WATCH":
@@ -1934,25 +1941,49 @@ def monitors_page():
     """
 
 @app.get("/gap-up", response_class=HTMLResponse)
-def gap_up_page():
+def gap_up_page(filter: str = "3"):
     alert_memory = load_gap_alerts()
     portfolio = load_portfolio()
-    rows_data = []
+    all_rows = []
 
     for ticker in unique_watchlist_tickers():
         row = get_gap_up_data(ticker)
-        if row and row["status"] != "NO GAP":
-            rows_data.append(row)
+        if row:
+            all_rows.append(row)
             if should_send_gap_alert(row, alert_memory):
                 send_gap_alert(row)
 
     save_gap_alerts(alert_memory)
+
+    filter_options = {"top": None, "1": 1.0, "2": 2.0, "3": 3.0}
+    if filter not in filter_options:
+        filter = "3"
+
+    selected_threshold = filter_options[filter]
+    sorted_all_rows = sorted(all_rows, key=lambda row: (-row["gap_pct"], row["ticker"]))
+    showing_fallback = False
+    if selected_threshold is None:
+        rows_data = sorted_all_rows[:10]
+        filter_label = "Top 10 gaps"
+    else:
+        rows_data = [
+            row
+            for row in sorted_all_rows
+            if row["gap_pct"] >= selected_threshold
+        ]
+        filter_label = f"Gap > {selected_threshold:g}%"
+        if not rows_data:
+            rows_data = sorted_all_rows[:10]
+            showing_fallback = True
 
     status_rank = {
         "PULLBACK BUY WATCH": 0,
         "GAP HELD": 1,
         "GAP UP WATCH": 2,
         "GAP FAILED": 3,
+        "NEAR THRESHOLD": 4,
+        "WATCHING": 5,
+        "NO GAP": 6,
     }
     rows_data.sort(key=lambda row: (status_rank.get(row["status"], 9), -row["gap_pct"], row["ticker"]))
 
@@ -1964,6 +1995,9 @@ def gap_up_page():
             "GAP HELD": "#dbeafe",
             "GAP UP WATCH": "#fef9c3",
             "GAP FAILED": "#fee2e2",
+            "NEAR THRESHOLD": "#ffedd5",
+            "WATCHING": "#f8fafc",
+            "NO GAP": "#f5f5f5",
         }.get(status, "#f5f5f5")
         price = row["current_price"]
         position = get_position_details(row["ticker"], price, portfolio)
@@ -2001,11 +2035,25 @@ def gap_up_page():
     if not rows:
         rows = """
         <tr>
-            <td colspan="19">No watchlist tickers are gapping up more than 3% right now.</td>
+            <td colspan="19">No gap data is available for the current watchlists.</td>
         </tr>
         """
 
     updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    filter_links = []
+    for option, label in (
+        ("top", "Top Gaps"),
+        ("1", "Gap > 1%"),
+        ("2", "Gap > 2%"),
+        ("3", "Gap > 3%"),
+    ):
+        active = "active" if filter == option else ""
+        filter_links.append(f'<a class="{active}" href="/gap-up?filter={option}">{label}</a>')
+    filter_note = (
+        f"No names matched {html.escape(filter_label)}, so showing the top 10 watchlist gaps."
+        if showing_fallback
+        else f"Showing {html.escape(filter_label)}."
+    )
 
     return f"""
     <html>
@@ -2019,6 +2067,20 @@ def gap_up_page():
             a {{ font-size: 18px; margin-right: 10px; }}
             .reason {{ text-align: left; min-width: 220px; }}
             .note {{ color: #555; max-width: 900px; line-height: 1.4; }}
+            .gap-filters {{ margin: 15px 0 20px; }}
+            .gap-filters a {{
+                display: inline-block;
+                padding: 8px 14px;
+                border: 1px solid #777;
+                border-radius: 5px;
+                text-decoration: none;
+                font-size: 15px;
+            }}
+            .gap-filters a.active {{
+                background: #2e7d32;
+                color: white;
+                border-color: #2e7d32;
+            }}
         </style>
     </head>
     <body>
@@ -2031,6 +2093,10 @@ def gap_up_page():
             Telegram alerts are sent only for GAP UP WATCH and PULLBACK BUY WATCH. A pullback buy watch requires RSI above 50
             and price holding/reclaiming VWAP and EMA22.
         </p>
+        <div class="gap-filters">
+            {"".join(filter_links)}
+        </div>
+        <p class="note">{filter_note}</p>
 
         <table>
             <tr>
