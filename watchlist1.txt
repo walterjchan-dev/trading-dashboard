@@ -8,3 +8,4 @@ BE
 CRDO
 QQQ
 SPY
+COIN
