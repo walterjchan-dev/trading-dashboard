@@ -13,12 +13,15 @@ import urllib.request
 app = FastAPI()
 MONITOR_FILE = "monitor.json"
 GAP_ALERTS_FILE = "gap_alerts.json"
+PULLBACK_ALERTS_FILE = "pullback_alerts.json"
 PORTFOLIO_FILE = "portfolio.json"
 PORTFOLIO_CSV_FILE = "portfolio.csv"
 EARNINGS_CACHE_FILE = "earnings_cache.json"
 EARNINGS_CACHE_TTL = timedelta(hours=24)
 GAP_UP_THRESHOLD_PCT = 3.0
 GAP_SUPPORT_NEAR_PCT = 0.75
+PULLBACK_NEAR_SUPPORT_PCT = 0.75
+PULLBACK_EXTENDED_PCT = 3.0
 
 def load_monitors():
     try:
@@ -42,6 +45,19 @@ def load_gap_alerts():
 
 def save_gap_alerts(alerts):
     with open(GAP_ALERTS_FILE, "w") as f:
+        json.dump(alerts, f, indent=2)
+
+def load_pullback_alerts():
+    try:
+        with open(PULLBACK_ALERTS_FILE, "r") as f:
+            alerts = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+    return alerts if isinstance(alerts, dict) else {}
+
+def save_pullback_alerts(alerts):
+    with open(PULLBACK_ALERTS_FILE, "w") as f:
         json.dump(alerts, f, indent=2)
 
 def load_portfolio():
@@ -568,12 +584,32 @@ def get_gap_up_data(ticker):
     )
     reclaimed_support = near_support and above_vwap and above_ema22
     gap_up = gap_pct >= GAP_UP_THRESHOLD_PCT
+    momentum_15m = get_rsi_data(ticker, "15m")
+    momentum_1h = get_rsi_data(ticker, "1h")
+    momentum_score, momentum_reason = get_monitor_score(momentum_15m, momentum_1h)
+    bullish_close = current_price > float(today_open.iloc[-1]) if not today_open.empty else False
+    distance_from_vwap = percent_distance(current_price, vwap)
+    distance_from_ema22 = percent_distance(current_price, ema22)
+    pullback_score = 0
+    if momentum_score >= 8:
+        pullback_score += 2
+    if rsi_above_50 and above_ema22:
+        pullback_score += 2
+    if near_support:
+        pullback_score += 2
+    if reclaimed_support:
+        pullback_score += 2
+    if bullish_close:
+        pullback_score += 1
+    if above_vwap:
+        pullback_score += 1
+    pullback_score = min(pullback_score, 10)
 
     if not gap_up:
         status = "NO GAP"
     elif current_price <= previous_close or (not above_vwap and not above_ema22):
         status = "GAP FAILED"
-    elif reclaimed_support and rsi_above_50 and volume_strong:
+    elif momentum_score >= 8 and reclaimed_support and rsi_above_50 and bullish_close:
         status = "PULLBACK BUY WATCH"
     elif current_price >= gap_price and rsi_above_50:
         status = "GAP HELD"
@@ -590,10 +626,14 @@ def get_gap_up_data(ticker):
     reasons.append("Above EMA22" if above_ema22 else "Below EMA22")
     reasons.append("Above VWAP" if above_vwap else "Below VWAP")
     reasons.append("RSI above 50" if rsi_above_50 else "RSI below 50")
+    reasons.append(f"Momentum score {momentum_score}/10")
     if gap_up and status == "GAP UP WATCH":
         reasons.append("Wait for pullback to VWAP / EMA22")
     if status == "PULLBACK BUY WATCH":
         reasons.append("Pulled back near support and reclaimed VWAP / EMA22")
+        reasons.append("Candle closed green")
+    elif gap_up and near_support and not reclaimed_support:
+        reasons.append("Pulled near support but has not reclaimed it yet")
 
     return {
         "ticker": ticker,
@@ -613,6 +653,12 @@ def get_gap_up_data(ticker):
         "above_ema22": above_ema22,
         "near_support": near_support,
         "reclaimed_support": reclaimed_support,
+        "momentum_score": momentum_score,
+        "momentum_reason": momentum_reason,
+        "pullback_score": pullback_score,
+        "extended_status": get_extended_status(distance_from_vwap, distance_from_ema22),
+        "distance_from_vwap": distance_from_vwap,
+        "distance_from_ema22": distance_from_ema22,
         "reasons": reasons,
     }
 
@@ -640,6 +686,10 @@ def should_send_gap_alert(row, alert_memory):
     return True
 
 def send_gap_alert(row):
+    if row["status"] == "PULLBACK BUY WATCH":
+        send_pullback_alert(row)
+        return
+
     lines = [
         "GAP-UP MONITOR",
         f"Ticker: {row['ticker']}",
@@ -809,6 +859,263 @@ def get_monitor_score(data_15m, data_1h):
 
     return min(score, 10), ", ".join(reasons) if reasons else "No bullish confirmation yet"
 
+def percent_distance(price, level):
+    if price is None or level in (None, 0):
+        return None
+
+    return (price - level) / level * 100
+
+def format_percent_distance(value):
+    return f"{value:+.2f}%" if value is not None else "N/A"
+
+def get_extended_status(distance_from_vwap, distance_from_ema22):
+    distances = [
+        abs(value)
+        for value in (distance_from_vwap, distance_from_ema22)
+        if value is not None
+    ]
+
+    if not distances:
+        return "Unknown"
+
+    nearest_distance = min(distances)
+    if nearest_distance <= PULLBACK_NEAR_SUPPORT_PCT:
+        return "Near support"
+    if nearest_distance >= PULLBACK_EXTENDED_PCT:
+        return "Extended"
+    return "Moderately extended"
+
+def get_pullback_timeframe_data(ticker):
+    df = yf.download(
+        ticker,
+        period="5d",
+        interval="15m",
+        progress=False,
+        auto_adjust=True,
+    )
+
+    if df.empty:
+        return None
+
+    open_price = as_series(df["Open"]).dropna()
+    high = as_series(df["High"]).dropna()
+    low = as_series(df["Low"]).dropna()
+    close = as_series(df["Close"]).dropna()
+    volume = as_series(df["Volume"]).fillna(0)
+
+    if len(close) < 30 or len(low) < 30 or len(open_price) < 2:
+        return None
+
+    latest_date = pd.Timestamp(close.index[-1]).date()
+    today_mask = close.index.date == latest_date
+    today_close = close[today_mask]
+    today_high = high[high.index.date == latest_date]
+    today_low = low[low.index.date == latest_date]
+    today_volume = volume[volume.index.date == latest_date]
+
+    if today_close.empty or today_high.empty or today_low.empty or today_volume.empty:
+        return None
+
+    typical_price = (
+        today_high.reindex(today_close.index).ffill()
+        + today_low.reindex(today_close.index).ffill()
+        + today_close
+    ) / 3
+    cumulative_volume = today_volume.reindex(today_close.index).fillna(0).cumsum()
+    cumulative_value = (typical_price * today_volume.reindex(today_close.index).fillna(0)).cumsum()
+    vwap = None
+    if not cumulative_volume.empty and float(cumulative_volume.iloc[-1]) > 0:
+        vwap = float(cumulative_value.iloc[-1] / cumulative_volume.iloc[-1])
+
+    ema22 = close.ewm(span=22, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    rsi_values = calc_rsi(close).dropna()
+
+    if len(ema22) < 2 or len(ema50) < 2 or rsi_values.empty:
+        return None
+
+    current_price = series_float(close, -1)
+    previous_close = series_float(close, -2)
+    current_open = series_float(open_price, -1)
+    current_low = series_float(low, -1)
+    current_ema22 = series_float(ema22, -1)
+    previous_ema22 = series_float(ema22, -2)
+    current_ema50 = series_float(ema50, -1)
+    current_rsi = series_float(rsi_values, -1)
+    prior_support = None
+
+    recent_lows = low.iloc[-24:-2].dropna()
+    if not recent_lows.empty:
+        prior_support = float(recent_lows.min())
+
+    support_candidates = [
+        ("VWAP", vwap),
+        ("EMA22", current_ema22),
+        ("Prior support", prior_support),
+    ]
+    valid_supports = [
+        (name, level)
+        for name, level in support_candidates
+        if level is not None and level > 0
+    ]
+    touched_supports = [
+        name
+        for name, level in valid_supports
+        if current_low <= level * (1 + PULLBACK_NEAR_SUPPORT_PCT / 100)
+    ]
+    reclaimed_supports = [
+        name
+        for name, level in valid_supports
+        if current_price >= level and (
+            previous_close < level
+            or current_low <= level * (1 + PULLBACK_NEAR_SUPPORT_PCT / 100)
+        )
+    ]
+
+    above_ema22 = current_price >= current_ema22
+    reclaimed_ema22 = previous_close <= previous_ema22 and current_price > current_ema22
+    above_ema50 = current_price >= current_ema50
+    rsi_above_50 = current_rsi > 50
+    bullish_close = current_price > current_open
+    held_or_reclaimed = bool(reclaimed_supports) and (bullish_close or current_price >= current_ema22)
+
+    return {
+        "price": current_price,
+        "vwap": vwap,
+        "ema22": current_ema22,
+        "ema50": current_ema50,
+        "prior_support": prior_support,
+        "rsi": current_rsi,
+        "above_ema22": above_ema22,
+        "reclaimed_ema22": reclaimed_ema22,
+        "above_ema50": above_ema50,
+        "rsi_above_50": rsi_above_50,
+        "bullish_close": bullish_close,
+        "touched_supports": touched_supports,
+        "reclaimed_supports": reclaimed_supports,
+        "held_or_reclaimed": held_or_reclaimed,
+        "distance_from_vwap": percent_distance(current_price, vwap),
+        "distance_from_ema22": percent_distance(current_price, current_ema22),
+    }
+
+def get_pullback_signal(ticker):
+    data_15m = get_rsi_data(ticker, "15m")
+    data_1h = get_rsi_data(ticker, "1h")
+    momentum_score, momentum_reason = get_monitor_score(data_15m, data_1h)
+    pullback_data = get_pullback_timeframe_data(ticker)
+
+    score = 0
+    reasons = []
+    status = "MOMENTUM TOO WEAK"
+
+    if momentum_score >= 8:
+        score += 2
+        reasons.append("Strong momentum stock")
+    else:
+        reasons.append(f"Momentum score below 8 ({momentum_score}/10)")
+
+    if pullback_data:
+        bullish_structure = (
+            pullback_data["rsi_above_50"]
+            and (pullback_data["above_ema22"] or pullback_data["reclaimed_ema22"])
+        )
+        if bullish_structure:
+            score += 2
+            reasons.append("RSI above 50 and price above/reclaimed EMA22")
+        else:
+            reasons.append("Bullish structure not confirmed")
+
+        if pullback_data["above_ema50"]:
+            score += 1
+            reasons.append("Price above EMA50")
+
+        if pullback_data["touched_supports"]:
+            score += 2
+            reasons.append(
+                "Pullback near " + " / ".join(pullback_data["touched_supports"])
+            )
+
+        if pullback_data["held_or_reclaimed"]:
+            score += 2
+            reasons.append(
+                "Support held/reclaimed: "
+                + " / ".join(pullback_data["reclaimed_supports"])
+            )
+
+        if pullback_data["bullish_close"]:
+            score += 1
+            reasons.append("Candle closed green")
+
+        if (
+            momentum_score >= 8
+            and bullish_structure
+            and pullback_data["touched_supports"]
+            and pullback_data["held_or_reclaimed"]
+            and pullback_data["bullish_close"]
+            and pullback_data["rsi_above_50"]
+        ):
+            status = "PULLBACK BUY WATCH"
+        elif momentum_score >= 8 and pullback_data["touched_supports"]:
+            status = "PULLBACK MONITOR"
+        elif momentum_score >= 8:
+            status = "EXTENDED" if get_extended_status(
+                pullback_data["distance_from_vwap"],
+                pullback_data["distance_from_ema22"],
+            ) == "Extended" else "WAITING FOR PULLBACK"
+    else:
+        reasons.append("Pullback data unavailable")
+
+    score = min(score, 10)
+    distance_from_vwap = pullback_data["distance_from_vwap"] if pullback_data else None
+    distance_from_ema22 = pullback_data["distance_from_ema22"] if pullback_data else None
+
+    return {
+        "ticker": ticker,
+        "price": pullback_data["price"] if pullback_data else data_15m["price"] if data_15m else None,
+        "momentum_score": momentum_score,
+        "momentum_reason": momentum_reason,
+        "pullback_score": score,
+        "status": status,
+        "extended_status": get_extended_status(distance_from_vwap, distance_from_ema22),
+        "distance_from_vwap": distance_from_vwap,
+        "distance_from_ema22": distance_from_ema22,
+        "vwap": pullback_data["vwap"] if pullback_data else None,
+        "ema22": pullback_data["ema22"] if pullback_data else None,
+        "rsi": pullback_data["rsi"] if pullback_data else data_15m["now"] if data_15m else None,
+        "reasons": reasons,
+    }
+
+def should_send_pullback_alert(row, alert_memory):
+    if row["status"] != "PULLBACK BUY WATCH":
+        return False
+
+    key = row["ticker"]
+    current_state = f"{date.today().isoformat()}:{row['status']}:{row['pullback_score']}"
+    if alert_memory.get(key) == current_state:
+        return False
+
+    alert_memory[key] = current_state
+    return True
+
+def send_pullback_alert(row):
+    lines = [
+        "PULLBACK BUY WATCH",
+        f"Ticker: {row['ticker']}",
+        "Reason:",
+        "- Strong momentum stock",
+    ]
+
+    for reason in row["reasons"]:
+        if reason != "Strong momentum stock":
+            lines.append(f"- {reason}")
+
+    lines.extend([
+        f"Entry Quality: {row['pullback_score']}/10",
+        f"Distance from VWAP: {format_percent_distance(row['distance_from_vwap'])}",
+        f"Distance from EMA22: {format_percent_distance(row['distance_from_ema22'])}",
+    ])
+    send_telegram_message("\n".join(lines))
+
 def get_bottom_timeframe_data(ticker, timeframe):
     config = RSI_TIMEFRAMES[timeframe]
     df = yf.download(
@@ -977,6 +1284,63 @@ def format_payload_bool(value):
         return "false"
 
     return str(value)
+
+def get_payload_reasons(payload):
+    reasons = get_payload_value(payload, "reasons", "reason")
+    if isinstance(reasons, list):
+        return [str(reason) for reason in reasons if str(reason).strip()]
+    if reasons not in (None, ""):
+        return [
+            reason.strip()
+            for reason in str(reasons).replace("|", ";").split(";")
+            if reason.strip()
+        ]
+    return []
+
+def build_pullback_webhook_message(payload, ticker, price, timeframe):
+    reasons = get_payload_reasons(payload)
+    score = format_payload_score(get_payload_value(payload, "pullback_score", "entry_quality", "score"))
+    lines = ["PULLBACK BUY WATCH"]
+
+    if ticker:
+        lines.append(f"Ticker: {ticker}")
+    if timeframe:
+        lines.append(f"Timeframe: {timeframe}")
+    if price not in (None, ""):
+        lines.append(f"Price: {price}")
+
+    lines.extend(["", "Reason:"])
+    if reasons:
+        lines.extend(f"- {reason}" for reason in reasons)
+    else:
+        lines.extend([
+            "- Strong momentum stock",
+            "- Pullback to EMA22/VWAP/support",
+            "- RSI still above 50",
+            "- Support held/reclaimed",
+        ])
+
+    if score:
+        lines.append(f"Entry Quality: {score}")
+
+    optional_fields = (
+        ("Extended", get_payload_value(payload, "extended_status", "extended")),
+        ("Distance from VWAP", format_payload_number(get_payload_value(payload, "distance_from_vwap", "dist_vwap"))),
+        ("Distance from EMA22", format_payload_number(get_payload_value(payload, "distance_from_ema22", "dist_ema22"))),
+        ("RSI", format_payload_number(get_payload_value(payload, "rsi"))),
+        ("VWAP", format_payload_number(get_payload_value(payload, "vwap"))),
+        ("EMA22", format_payload_number(get_payload_value(payload, "ema22"))),
+    )
+
+    if any(value not in (None, "") for _, value in optional_fields):
+        lines.append("")
+        lines.extend(
+            f"{label}: {value}"
+            for label, value in optional_fields
+            if value not in (None, "")
+        )
+
+    return "\n".join(lines)
 
 def get_webhook_score(payload, signal):
     raw_score = get_payload_value(payload, "score")
@@ -1187,6 +1551,10 @@ async def webhook(request: Request):
     price = get_payload_value(payload, "price")
     timeframe = get_payload_value(payload, "timeframe", "interval")
     score = format_payload_score(get_webhook_score(payload, signal))
+
+    if "PULLBACK BUY WATCH" in str(signal or "").upper():
+        send_telegram_message(build_pullback_webhook_message(payload, ticker, price, timeframe))
+        return {"ok": True, "received": payload}
 
     lines = ["Trading Dashboard Alert", ""]
     if ticker:
@@ -1422,6 +1790,7 @@ def monitors_page():
     monitors = load_monitors()
     portfolio = load_portfolio()
     earnings_cache = load_earnings_cache()
+    pullback_alerts = load_pullback_alerts()
     monitored_tickers = sorted(
         ticker.upper()
         for ticker, status in monitors.items()
@@ -1430,20 +1799,42 @@ def monitors_page():
     rows_data = []
 
     for ticker in monitored_tickers:
-        rows_data.append(get_bottom_signal(ticker))
+        row = get_pullback_signal(ticker)
+        rows_data.append(row)
+        if should_send_pullback_alert(row, pullback_alerts):
+            send_pullback_alert(row)
 
-    rows_data.sort(key=lambda row: (-row["score"], row["ticker"]))
+    save_pullback_alerts(pullback_alerts)
+    status_rank = {
+        "PULLBACK BUY WATCH": 0,
+        "PULLBACK MONITOR": 1,
+        "WAITING FOR PULLBACK": 2,
+        "EXTENDED": 3,
+        "MOMENTUM TOO WEAK": 4,
+    }
+    rows_data.sort(key=lambda row: (
+        status_rank.get(row["status"], 9),
+        -row["pullback_score"],
+        row["ticker"],
+    ))
     rows = ""
 
     for row in rows_data:
-        score = row["score"]
-        color = "#dcfce7" if score >= 8 else "#fef9c3" if score >= 5 else "#fee2e2"
+        score = row["pullback_score"]
+        color = {
+            "PULLBACK BUY WATCH": "#dcfce7",
+            "PULLBACK MONITOR": "#dbeafe",
+            "WAITING FOR PULLBACK": "#fef9c3",
+            "EXTENDED": "#fed7aa",
+            "MOMENTUM TOO WEAK": "#fee2e2",
+        }.get(row["status"], "#f5f5f5")
         price = f"{row['price']:.2f}" if row["price"] is not None else "N/A"
-        rsi_15m = f"{row['rsi_15m']:.2f}" if row["rsi_15m"] is not None else "N/A"
-        rsi_1h = f"{row['rsi_1h']:.2f}" if row["rsi_1h"] is not None else "N/A"
+        rsi = f"{row['rsi']:.2f}" if row["rsi"] is not None else "N/A"
+        vwap = f"{row['vwap']:.2f}" if row["vwap"] is not None else "N/A"
+        ema22 = f"{row['ema22']:.2f}" if row["ema22"] is not None else "N/A"
         position = get_position_details(row["ticker"], row["price"], portfolio)
         earnings = get_earnings_info(row["ticker"], earnings_cache)
-        reason = row["reason"]
+        reason = "; ".join(row["reasons"])
         if earnings["reason"]:
             reason = f"{reason}, {earnings['reason']}"
         ticker_style = "font-weight:bold;color:#0f5132;" if position["owned"] else ""
@@ -1458,24 +1849,28 @@ def monitors_page():
                     <button type="submit" class="monitor-button">ON</button>
                 </form>
             </td>
+            <td><strong>{html.escape(row['status'])}</strong></td>
+            <td><strong>{row['momentum_score']}/10</strong></td>
             <td><strong>{score}/10</strong></td>
+            <td>{html.escape(row['extended_status'])}</td>
+            <td>{format_percent_distance(row['distance_from_vwap'])}</td>
+            <td>{format_percent_distance(row['distance_from_ema22'])}</td>
             <td class="reason">{html.escape(reason)}</td>
             <td>{price}</td>
             <td>{position['position']}</td>
             <td>{position['avg_cost']}</td>
             <td>{position['pl_pct']}</td>
             <td style="{earnings['style']}">{earnings['date_text']}</td>
-            <td>{rsi_15m}</td>
-            <td>{rsi_1h}</td>
-            <td>{html.escape(row['price_vs_ema21'])}</td>
-            <td>{html.escape(row['rsi_trend'])}</td>
+            <td>{vwap}</td>
+            <td>{ema22}</td>
+            <td>{rsi}</td>
         </tr>
         """
 
     if not rows:
         rows = """
         <tr>
-            <td colspan="13">No tickers are currently being monitored.</td>
+            <td colspan="17">No tickers are currently being monitored.</td>
         </tr>
         """
 
@@ -1493,6 +1888,7 @@ def monitors_page():
             th {{ background: #eee; }}
             a {{ font-size: 18px; margin-right: 10px; }}
             .reason {{ text-align: left; }}
+            .note {{ color: #555; max-width: 1000px; line-height: 1.4; }}
             .monitor-button {{
                 background: #2e7d32;
                 color: white;
@@ -1505,23 +1901,31 @@ def monitors_page():
     <body>
         {nav()}
 
-        <h2>Bottom Signal</h2>
+        <h2>Pullback Monitor</h2>
         <p>Updated: {updated}</p>
+        <p class="note">
+            MOMENTUM finds strong stocks. PULLBACK BUY WATCH waits for a better entry: momentum score at least 8,
+            RSI above 50, price above or reclaiming EMA22, and support held or reclaimed near VWAP, EMA22, or prior support.
+        </p>
         <table>
             <tr>
                 <th>Ticker</th>
                 <th>Monitor</th>
-                <th>Bottom Score</th>
-                <th>Reason</th>
+                <th>Pullback Status</th>
+                <th>Momentum Score</th>
+                <th>Pullback Score</th>
+                <th>Extended</th>
+                <th>Dist VWAP</th>
+                <th>Dist EMA22</th>
+                <th>Reasons</th>
                 <th>Price</th>
                 <th>Position</th>
                 <th>Avg Cost</th>
                 <th>Unrealized P/L %</th>
                 <th>Earnings Date</th>
-                <th>15m RSI</th>
-                <th>1H RSI</th>
-                <th>Price vs EMA21</th>
-                <th>RSI Trend</th>
+                <th>VWAP</th>
+                <th>EMA22</th>
+                <th>RSI</th>
             </tr>
             {rows}
         </table>
@@ -1580,6 +1984,11 @@ def gap_up_page():
             <td>{row['previous_close']:.2f}</td>
             <td>{format_compact_volume(row['intraday_volume'])}</td>
             <td>{avg_volume}</td>
+            <td>{row['momentum_score']}/10</td>
+            <td>{row['pullback_score']}/10</td>
+            <td>{html.escape(row['extended_status'])}</td>
+            <td>{format_percent_distance(row['distance_from_vwap'])}</td>
+            <td>{format_percent_distance(row['distance_from_ema22'])}</td>
             <td>{vwap}</td>
             <td>{row['ema22']:.2f}</td>
             <td>{rsi}</td>
@@ -1592,7 +2001,7 @@ def gap_up_page():
     if not rows:
         rows = """
         <tr>
-            <td colspan="14">No watchlist tickers are gapping up more than 3% right now.</td>
+            <td colspan="19">No watchlist tickers are gapping up more than 3% right now.</td>
         </tr>
         """
 
@@ -1633,6 +2042,11 @@ def gap_up_page():
                 <th>Prev Close</th>
                 <th>Volume</th>
                 <th>Avg Volume</th>
+                <th>Momentum Score</th>
+                <th>Pullback Score</th>
+                <th>Extended</th>
+                <th>Dist VWAP</th>
+                <th>Dist EMA22</th>
                 <th>VWAP</th>
                 <th>EMA22</th>
                 <th>RSI</th>
